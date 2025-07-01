@@ -1,0 +1,9 @@
+streamlit>=1.28.0
+pandas>=2.2.0
+numpy>=1.26.0
+pillow>=10.0.0
+azure-storage-blob>=12.0.0
+python-dotenv>=1.0.0
+psycopg2-binary>=2.9.0
+openpyxl>=3.1.0
+sib-api-v3-sdk 
