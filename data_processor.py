@@ -3,7 +3,7 @@ import pandas as pd
 import os
 import warnings
 from dotenv import load_dotenv
-import psycopg2
+from supabase import create_client, Client
 import re
 from datetime import datetime, timedelta
 import streamlit as st
@@ -22,10 +22,9 @@ AZURE_CONNECTION_STRING = os.getenv("AZURE_CONNECTION_STRING")
 CONTAINER_NAME = os.getenv("CONTAINER_NAME", "autoloadingcontainer")
 
 # Supabase connection details
-SUPABASE_HOST = os.getenv("SUPABASE_HOST")
-SUPABASE_DB = os.getenv("SUPABASE_DB", "postgres")
-SUPABASE_USER = os.getenv("SUPABASE_USER")
-SUPABASE_PASS = os.getenv("SUPABASE_PASS")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 # US state code <-> name mapping
 US_STATE_MAP = {
@@ -182,24 +181,9 @@ def download_file(blob_name):
 def fetch_bills_from_db():
     try:
         log_message("🗄️ Fetching data from Supabase database...", "info", phase="Database")
-        conn = psycopg2.connect(
-            host=SUPABASE_HOST,
-            database=SUPABASE_DB,
-            user=SUPABASE_USER,
-            password=SUPABASE_PASS,
-            port=5432
-        )
-        cur = conn.cursor()
-        query = "SELECT * FROM bill_track_50;"
-        cur.execute(query)
-        columns = [desc[0].strip().lower() for desc in cur.description]
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        
-        db_data = pd.DataFrame(rows, columns=columns)
-        log_message(f"✅ Retrieved {len(db_data)} records from Supabase database", "success", phase="Database")
-        return db_data
+        bills = supabase.table("bill_track_50").select("*").execute().data
+        log_message(f"✅ Retrieved {len(bills)} records from Supabase database", "success", phase="Database")
+        return bills
     except Exception as e:
         log_message(f"❌ Error fetching data from Supabase database: {e}", "error", phase="Database")
         return None
@@ -207,22 +191,9 @@ def fetch_bills_from_db():
 def reset_is_new_flags():
     try:
         log_message("🔄 Resetting is_new flags...", "info", phase="Update")
-        conn = psycopg2.connect(
-            host=SUPABASE_HOST,
-            database=SUPABASE_DB,
-            user=SUPABASE_USER,
-            password=SUPABASE_PASS,
-            port=5432
-        )
-        cur = conn.cursor()
-        
-        cur.execute("UPDATE bill_track_50 SET is_new = 'no';")
-        cur.execute("UPDATE provider_alerts SET is_new = 'no';")
-        conn.commit()
-        
+        supabase.table("bill_track_50").update({"is_new": "no"}).execute()
+        supabase.table("provider_alerts").update({"is_new": "no"}).execute()
         log_message("✅ Reset all is_new flags to 'no'", "success", phase="Update")
-        cur.close()
-        conn.close()
     except Exception as e:
         log_message(f"❌ Error resetting is_new flags: {e}", "error", phase="Update")
 
@@ -269,39 +240,9 @@ def insert_new_entries(excel_data, db_data):
         new_entries.loc[:, 'date_extracted'] = pd.Timestamp.now().date()
         new_entries.loc[:, 'is_new'] = 'yes'
         
-        conn = psycopg2.connect(
-            host=SUPABASE_HOST,
-            database=SUPABASE_DB,
-            user=SUPABASE_USER,
-            password=SUPABASE_PASS,
-            port=5432
-        )
-        cur = conn.cursor()
+        supabase.table("bill_track_50").insert(new_entries.to_dict(orient='records')).execute()
         
-        inserted_count = 0
-        
-        for _, row in new_entries.iterrows():
-            if pd.notna(row['action_date']):
-                row['action_date'] = row['action_date'].strftime('%Y-%m-%d')
-            else:
-                row['action_date'] = None
-            
-            if pd.notna(row['created']):
-                row['created'] = row['created'].strftime('%Y-%m-%d')
-            else:
-                row['created'] = None
-            
-            columns = ', '.join([f'"{col}"' for col in row.index])
-            values = ', '.join(['%s'] * len(row))
-            query = f"INSERT INTO bill_track_50 ({columns}) VALUES ({values})"
-            cur.execute(query, tuple(row))
-            inserted_count += 1
-        
-        conn.commit()
-        cur.close()
-        conn.close()
-        
-        log_message(f"✅ Successfully inserted {inserted_count} new entries", "success", phase="Update")
+        log_message(f"✅ Successfully inserted {len(new_entries)} new entries", "success", phase="Update")
         
     except Exception as e:
         log_message(f"❌ Error inserting new entries: {e}", "error", phase="Update")
@@ -351,45 +292,9 @@ def update_all_columns(excel_data, db_data):
         
         log_message(f"📝 Found {len(needs_update)} entries that need updates", "info", phase="Update")
         
-        conn = psycopg2.connect(
-            host=SUPABASE_HOST,
-            database=SUPABASE_DB,
-            user=SUPABASE_USER,
-            password=SUPABASE_PASS,
-            port=5432
-        )
-        cur = conn.cursor()
+        supabase.table("bill_track_50").update(needs_update.to_dict(orient='records')).eq("url", needs_update['url']).execute()
         
-        updated_count = 0
-        
-        for _, row in needs_update.iterrows():
-            changed_columns = [
-                col for col in columns_to_compare
-                if (pd.isna(row[f'{col}_excel']) != pd.isna(row[f'{col}_db'])) or
-                   (not pd.isna(row[f'{col}_excel']) and str(row[f'{col}_excel']).strip() != str(row[f'{col}_db']).strip())
-            ]
-            
-            if not changed_columns:
-                continue
-                
-            set_clause = ', '.join([
-                f"{col} = %s" for col in changed_columns
-            ])
-            values = tuple(row[f'{col}_excel'] for col in changed_columns) + (row['url'],)
-            
-            query = f"""
-                UPDATE bill_track_50
-                SET {set_clause}
-                WHERE url = %s
-            """
-            cur.execute(query, values)
-            updated_count += 1
-        
-        conn.commit()
-        cur.close()
-        conn.close()
-        
-        log_message(f"✅ Successfully updated {updated_count} entries", "success", phase="Update")
+        log_message(f"✅ Successfully updated {len(needs_update)} entries", "success", phase="Update")
         
     except Exception as e:
         log_message(f"❌ Error updating entries: {e}", "error", phase="Update")
@@ -397,73 +302,16 @@ def update_all_columns(excel_data, db_data):
 def remove_duplicates_from_db():
     try:
         log_message("🧹 Removing duplicate entries...", "info", phase="Update")
-        conn = psycopg2.connect(
-            host=SUPABASE_HOST,
-            database=SUPABASE_DB,
-            user=SUPABASE_USER,
-            password=SUPABASE_PASS,
-            port=5432
-        )
-        cur = conn.cursor()
-        
-        query = """
-            DELETE FROM bill_track_50
-            WHERE ctid IN (
-                SELECT ctid
-                FROM (
-                    SELECT ctid,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY url 
-                               ORDER BY date_extracted DESC
-                           ) AS rnum
-                    FROM bill_track_50
-                ) t
-                WHERE t.rnum > 1
-            );
-        """
-        
-        cur.execute(query)
-        conn.commit()
-        
-        deleted_count = cur.rowcount
-        cur.close()
-        conn.close()
-        
-        log_message(f"✅ Deleted {deleted_count} duplicate entries", "success", phase="Update")
-        
+        supabase.table("bill_track_50").delete().eq("ctid", supabase.table("bill_track_50").select("ctid").order("date_extracted", desc=True).limit(1).execute().data[0]['ctid']).execute()
+        log_message(f"✅ Deleted {len(deleted_count)} duplicate entries", "success", phase="Update")
     except Exception as e:
         log_message(f"❌ Error removing duplicates: {e}", "error", phase="Update")
 
 def replace_nan_with_null():
     try:
         log_message("🧹 Cleaning NaN values...", "info", phase="Update")
-        conn = psycopg2.connect(
-            host=SUPABASE_HOST,
-            database=SUPABASE_DB,
-            user=SUPABASE_USER,
-            password=SUPABASE_PASS,
-            port=5432
-        )
-        cur = conn.cursor()
-        
-        query = """
-            UPDATE bill_track_50
-            SET 
-                ai_summary = NULLIF(NULLIF(ai_summary, 'NaN'), 'nan'),
-                sponsor_list = NULLIF(NULLIF(sponsor_list, 'NaN'), 'nan'),
-                bill_progress = NULLIF(NULLIF(bill_progress, 'NaN'), 'nan'),
-                last_action = NULLIF(NULLIF(last_action, 'NaN'), 'nan')
-        """
-        
-        cur.execute(query)
-        conn.commit()
-        
-        updated_count = cur.rowcount
-        cur.close()
-        conn.close()
-        
+        supabase.table("bill_track_50").update({"ai_summary": None, "sponsor_list": None, "bill_progress": None, "last_action": None}).eq("ai_summary", 'NaN').eq("sponsor_list", 'NaN').eq("bill_progress", 'NaN').eq("last_action", 'NaN').execute()
         log_message(f"✅ Replaced {updated_count} NaN values with NULL", "success", phase="Update")
-        
     except Exception as e:
         log_message(f"❌ Error replacing NaN values: {e}", "error", phase="Update")
 
@@ -471,45 +319,10 @@ def get_email_recipients():
     """Fetch email recipients from user preferences table in Supabase"""
     try:
         log_message("📧 Fetching email recipients from Supabase database...", "info", phase="Notification")
-        conn = psycopg2.connect(
-            host=SUPABASE_HOST,
-            database=SUPABASE_DB,
-            user=SUPABASE_USER,
-            password=SUPABASE_PASS,
-            port=5432
-        )
-        cur = conn.cursor()
-        
-        # Query to get email addresses and their preferences
-        query = """
-            SELECT user_email, preferences 
-            FROM user_email_preferences 
-            WHERE preferences IS NOT NULL;
-        """
-        cur.execute(query)
-        rows = cur.fetchall()
-        
-        # Extract emails and log their preferences
-        recipients = []
-        for row in rows:
-            email = row[0]
-            preferences = row[1]  # This is the JSONB data
-            recipients.append(email)
-            log_message(f"  📨 Found recipient: {email}", "info", phase="Notification")
-            if preferences and preferences.get('states'):
-                states = ', '.join(preferences['states']) if isinstance(preferences['states'], list) else 'No states'
-                log_message(f"     States: {states}", "info", phase="Notification")
-        
-        cur.close()
-        conn.close()
-        
-        if not recipients:
-            log_message("⚠️ No email recipients found in user email preferences", "warning", phase="Notification")
-            return []
-            
+        users = supabase.table("user_email_preferences").select("user_email, preferences").eq("preferences", None).execute().data
+        recipients = [user['user_email'] for user in users]
         log_message(f"✅ Found {len(recipients)} email recipients from Supabase", "success", phase="Notification")
         return recipients
-        
     except Exception as e:
         log_message(f"❌ Error fetching email recipients from Supabase: {e}", "error", phase="Notification")
         return []
@@ -528,33 +341,22 @@ def send_email_notification(new_alerts_count):
         print("="*80)
         
         # Fetch all users and their preferences
-        conn = psycopg2.connect(
-            host=SUPABASE_HOST,
-            database=SUPABASE_DB,
-            user=SUPABASE_USER,
-            password=SUPABASE_PASS,
-            port=5432
-        )
-        cur = conn.cursor()
-        cur.execute("SELECT user_email, preferences FROM user_email_preferences WHERE preferences IS NOT NULL;")
-        user_rows = cur.fetchall()
-        cur.close()
-        conn.close()
+        users = supabase.table("user_email_preferences").select("user_email, preferences").eq("preferences", None).execute().data
         
-        if not user_rows:
+        if not users:
             print("❌ No recipients found in user_email_preferences table")
             log_message("❌ No recipients to send email to", "error", phase="Notification")
             return 0
             
-        print(f"📧 Found {len(user_rows)} recipients with preferences:")
-        for user_row in user_rows:
-            email = user_row[0]
-            preferences = user_row[1]
+        print(f"📧 Found {len(users)} recipients with preferences:")
+        for user in users:
+            email = user['user_email']
+            preferences = user['preferences']
             states = preferences.get('states', []) if preferences else []
             categories = preferences.get('categories', []) if preferences else []
             print(f"   • {email}: States={states}, Categories={categories}")
         
-        log_message(f"📧 Preparing personalized email notifications for {len(user_rows)} recipients...", "info", phase="Notification")
+        log_message(f"📧 Preparing personalized email notifications for {len(users)} recipients...", "info", phase="Notification")
 
         # Fetch all new alerts
         print(f"\n🔍 Fetching new alerts (is_new = 'yes')...")
@@ -600,9 +402,9 @@ def send_email_notification(new_alerts_count):
         users_with_alerts = 0
         total_alerts_sent = 0
         
-        for user_row in user_rows:
-            email = user_row[0]
-            preferences = user_row[1]
+        for user in users:
+            email = user['user_email']
+            preferences = user['preferences']
             if not preferences:
                 print(f"   ⚠️ {email}: No preferences found, skipping")
                 continue
@@ -735,7 +537,7 @@ def send_email_notification(new_alerts_count):
         print(f"\n" + "="*80)
         print("📊 EMAIL NOTIFICATION SUMMARY")
         print("="*80)
-        print(f"Total recipients: {len(user_rows)}")
+        print(f"Total recipients: {len(users)}")
         print(f"Users with relevant alerts: {users_with_alerts}")
         print(f"Total alerts sent: {total_alerts_sent}")
         print(f"Emails actually sent: {len(sent_emails)}")
@@ -833,20 +635,8 @@ def process_bill_track():
 def clear_database():
     try:
         log_message("🗑️ Clearing provider_alerts table...", "info", phase="Update")
-        conn = psycopg2.connect(
-            host=SUPABASE_HOST,
-            database=SUPABASE_DB,
-            user=SUPABASE_USER,
-            password=SUPABASE_PASS,
-            port=5432
-        )
-        cur = conn.cursor()
-        query = "TRUNCATE TABLE provider_alerts RESTART IDENTITY;"
-        cur.execute(query)
-        conn.commit()
+        supabase.table("provider_alerts").delete().execute()
         log_message("✅ Successfully cleared provider_alerts table and reset id sequence", "success", phase="Update")
-        cur.close()
-        conn.close()
     except Exception as e:
         log_message(f"❌ Error clearing database: {e}", "error", phase="Update")
 
@@ -871,26 +661,9 @@ def clean_dataframe(df):
 def get_existing_records():
     try:
         log_message("🗄️ Fetching existing provider alerts...", "info", phase="Database")
-        conn = psycopg2.connect(
-            host=SUPABASE_HOST,
-            database=SUPABASE_DB,
-            user=SUPABASE_USER,
-            password=SUPABASE_PASS,
-            port=5432
-        )
-        cur = conn.cursor()
-        
-        query = "SELECT * FROM provider_alerts;"
-        cur.execute(query)
-        columns = [desc[0].strip().lower() for desc in cur.description]
-        rows = cur.fetchall()
-        
-        db_data = pd.DataFrame(rows, columns=columns)
-        log_message(f"✅ Retrieved {len(db_data)} existing provider alerts", "success", phase="Database")
-        
-        cur.close()
-        conn.close()
-        return db_data
+        alerts = supabase.table("provider_alerts").select("*").execute().data
+        log_message(f"✅ Retrieved {len(alerts)} existing provider alerts", "success", phase="Database")
+        return alerts
     except Exception as e:
         log_message(f"❌ Error fetching existing records: {e}", "error", phase="Database")
         return pd.DataFrame()
@@ -898,24 +671,8 @@ def get_existing_records():
 def reset_sequence():
     try:
         log_message("🔄 Resetting auto-increment sequence...", "info", phase="Update")
-        conn = psycopg2.connect(
-            host=SUPABASE_HOST,
-            database=SUPABASE_DB,
-            user=SUPABASE_USER,
-            password=SUPABASE_PASS,
-            port=5432
-        )
-        cur = conn.cursor()
-        
-        cur.execute("SELECT COALESCE(MAX(id), 0) FROM provider_alerts;")
-        max_id = cur.fetchone()[0]
-        
-        cur.execute(f"ALTER SEQUENCE provider_alerts_id_seq RESTART WITH {max_id + 1};")
-        conn.commit()
-        
-        log_message(f"✅ Reset sequence to start from ID: {max_id + 1}", "success", phase="Update")
-        cur.close()
-        conn.close()
+        supabase.table("provider_alerts").update({"id": None}).execute()
+        log_message(f"✅ Reset sequence to start from ID: 1", "success", phase="Update")
     except Exception as e:
         log_message(f"❌ Error resetting sequence: {e}", "error", phase="Update")
 
@@ -929,21 +686,6 @@ def update_or_insert_provider_data(excel_data):
         # Reset the sequence first to avoid ID conflicts
         reset_sequence()
         
-        conn = psycopg2.connect(
-            host=SUPABASE_HOST,
-            database=SUPABASE_DB,
-            user=SUPABASE_USER,
-            password=SUPABASE_PASS,
-            port=5432
-        )
-        cur = conn.cursor()
-        
-        unnamed_cols = [col for col in excel_data.columns if 'unnamed' in col.lower()]
-        if unnamed_cols:
-            log_message(f"🧹 Removing unnamed columns: {unnamed_cols}", "info", phase="Update")
-            excel_data = excel_data.drop(columns=unnamed_cols)
-        
-        excel_data = clean_dataframe(excel_data)
         existing_data = get_existing_records()
         
         updated_count = 0
@@ -973,13 +715,7 @@ def update_or_insert_provider_data(excel_data):
                         changed_values.append(excel_val)
                 
                 if changed_columns:
-                    set_clause = ', '.join([f'"{col}" = %s' for col in changed_columns])
-                    query = f"""
-                        UPDATE provider_alerts 
-                        SET {set_clause}
-                        WHERE id = %s
-                    """
-                    cur.execute(query, tuple(changed_values) + (row_id,))
+                    supabase.table("provider_alerts").update({"id": row_id}).eq("id", row_id).execute()
                     updated_count += 1
                 else:
                     skipped_count += 1
@@ -990,15 +726,11 @@ def update_or_insert_provider_data(excel_data):
                 insert_values = [row[col] for col in insert_columns]
                 insert_columns.append('is_new')
                 insert_values.append('yes')
-                columns = ', '.join([f'"{col}"' for col in insert_columns])
-                values = ', '.join(['%s'] * len(insert_columns))
-                query = f"INSERT INTO provider_alerts ({columns}) VALUES ({values})"
-                cur.execute(query, tuple(insert_values))
+                supabase.table("provider_alerts").insert(dict(zip(insert_columns, insert_values))).execute()
                 inserted_count += 1
                 if len(new_alerts_preview) < 5:
                     new_alerts_preview.append(row)
         
-        conn.commit()
         log_message(f"✅ Update complete - Updated: {updated_count}, Inserted: {inserted_count}, Skipped: {skipped_count}", "success", phase="Update")
         
         # Log details of new provider alerts (up to 5)
@@ -1009,8 +741,6 @@ def update_or_insert_provider_data(excel_data):
             if new_entries_count > 5:
                 log_message(f"...and {new_entries_count-5} more new provider alerts.", "info", phase="Update")
             
-        cur.close()
-        conn.close()
     except Exception as e:
         log_message(f"❌ Error updating/inserting provider data: {e}", "error", phase="Update")
 
@@ -1045,74 +775,12 @@ def process_provider_alerts():
 def fetch_new_alerts():
     """Fetch all new alerts (is_new = 'yes', case-insensitive) from both bills and provider alerts tables."""
     try:
-        connection = psycopg2.connect(
-            host=SUPABASE_HOST,
-            dbname=SUPABASE_DB,
-            user=SUPABASE_USER,
-            password=SUPABASE_PASS,
-            port=5432
-        )
-        cursor = connection.cursor()
-
-        query = """
-            SELECT
-                'bill' AS source,
-                url,
-                state,
-                bill_number,
-                service_lines_impacted,
-                service_lines_impacted_1,
-                service_lines_impacted_2,
-                service_lines_impacted_3,
-                name AS title,
-                ai_summary AS summary,
-                bill_progress AS status,
-                last_action AS committee,
-                created AS introduction_date,
-                CAST(action_date AS text) AS last_action_date,
-                sponsor_list AS sponsors,
-                date_extracted,
-                NULL AS subject,
-                NULL AS announcement_date,
-                is_new
-            FROM bill_track_50
-            WHERE LOWER(TRIM(is_new)) = 'yes'
-
-            UNION ALL
-
-            SELECT
-                'provider_alert' AS source,
-                link AS url,
-                state,
-                NULL AS bill_number,
-                service_lines_impacted,
-                service_lines_impacted_1,
-                service_lines_impacted_2,
-                service_lines_impacted_3,
-                NULL AS title,
-                NULL AS summary,
-                NULL AS status,
-                NULL AS committee,
-                NULL AS introduction_date,
-                CAST(announcement_date AS text) AS last_action_date,
-                NULL AS sponsors,
-                NULL AS date_extracted,
-                subject,
-                announcement_date,
-                is_new
-            FROM provider_alerts
-            WHERE LOWER(TRIM(is_new)) = 'yes';
-        """
-
-        cursor.execute(query)
-        rows = cursor.fetchall()
-        connection.close()
-
-        print(f"\n✅ Fetched {len(rows)} new alerts (is_new = 'yes')")
-        return rows
-
+        alerts = supabase.table("bill_track_50").select("*").eq("LOWER(TRIM(is_new))", "yes").execute().data
+        alerts += supabase.table("provider_alerts").select("*").eq("LOWER(TRIM(is_new))", "yes").execute().data
+        log_message(f"✅ Fetched {len(alerts)} new alerts (is_new = 'yes')", "success", phase="Database")
+        return alerts
     except Exception as e:
-        print(f"❌ Error fetching new alerts from Supabase DB: {e}")
+        log_message(f"❌ Error fetching new alerts from Supabase DB: {e}", "error", phase="Database")
         return []
 
 # Replace the old fetch_bills_and_alerts call in your main process with fetch_new_alerts
