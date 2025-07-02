@@ -7,4 +7,4 @@ python-dotenv==1.0.1
 psycopg2-binary==2.9.9
 openpyxl==3.1.2
 sib-api-v3-sdk==7.6.0
-supabase-py==2.2.0
+supabase-py==1.2.0
